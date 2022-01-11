@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python
 from __future__ import print_function
 import roslib
 roslib.load_manifest('obstacle_avoidance')
@@ -10,11 +10,12 @@ from deep_learning import *
 from skimage.transform import resize
 from geometry_msgs.msg import Twist
 from std_msgs.msg import Float32, Int8
-from std_srvs.srv import SetBool, SetBoolResponse
+from std_srvs.srv import SetBool, SetBoolResponse, Trigger
 import csv
 import os
 import time
 import copy
+import math
 
 class cource_following_learning_node:
 	def __init__(self):
@@ -23,12 +24,21 @@ class cource_following_learning_node:
 		print("action_num: " + str(self.action_num))
 		self.dl = deep_learning(n_action = self.action_num)
 		self.bridge = CvBridge()
-		self.image_sub = rospy.Subscriber("/camera_center/image_raw", Image, self.callback)
+		self.image_sub = rospy.Subscriber("/camera/rgb/image_raw", Image, self.callback)
+		self.image_left_sub = rospy.Subscriber("/camera_left/rgb/image_raw", Image, self.callback_left_camera)
+		self.image_right_sub = rospy.Subscriber("/camera_right/rgb/image_raw", Image, self.callback_right_camera)
 		self.vel_sub = rospy.Subscriber("/nav_vel", Twist, self.callback_vel)
 		self.joy_sub = rospy.Subscriber("/joy_vel", Twist, self.callback_joy)
+		self.save_sub = rospy.Subscriber("/save_flag", Int8, self.callback_save)
 		self.action_pub = rospy.Publisher("action", Int8, queue_size=1)
 		self.nav_pub = rospy.Publisher('/cmd_vel', Twist, queue_size=10)
 		self.srv = rospy.Service('/learn_out', SetBool, self.callback_dl)
+		self.save_path = roslib.packages.get_pkg_dir(
+            'obstacle_avoidance') + '/net_models/tsudanuma_2-3_orbit1net'
+		"""
+		self.load_path = roslib.packages.get_pkg_dir(
+            'obstacle_avoidance') + '/net_models/tsudanuma_2-3_orbit1.net'
+		"""
 		self.action = 0.0
 		self.joy = Twist() 
 		self.joy_linear=0.0
@@ -36,12 +46,19 @@ class cource_following_learning_node:
 		self.vel = Twist()
 		self.episode = 0
 		self.cv_image = np.zeros((480,640,3), np.uint8)
+		self.cv_left_image = np.zeros((480,640,3), np.uint8)
+		self.cv_right_image = np.zeros((480,640,3), np.uint8)
 		self.learning = False
-		self.switch_mode = False
+		self.switch_mode = True
 		self.start_time = time.strftime("%Y%m%d_%H:%M:%S")
+		self.path = '/home/y-takahashi/catkin_ws/src/obstacle_avoidance/data/result/'
+		"""
 		self.path = '/home/rdclab/data/result/'
+		"""
 		self.start_time_s = rospy.get_time()
 		os.makedirs(self.path + self.start_time)
+		self.save_model = rospy.Service('/model_save', Trigger, self.model_save)
+		#self.dl.load(self.load_path)
 
 		with open(self.path + self.start_time + '/' +  'reward.csv', 'w') as f:
 			writer = csv.writer(f, lineterminator='\n')
@@ -50,6 +67,18 @@ class cource_following_learning_node:
 	def callback(self, data):
 		try:
 			self.cv_image = self.bridge.imgmsg_to_cv2(data, "bgr8")
+		except CvBridgeError as e:
+			print(e)
+
+	def callback_left_camera(self, data):
+		try:
+			self.cv_left_image = self.bridge.imgmsg_to_cv2(data, "bgr8")
+		except CvBridgeError as e:
+			print(e)
+			
+	def callback_right_camera(self, data):
+		try:
+			self.cv_right_image = self.bridge.imgmsg_to_cv2(data, "bgr8")
 		except CvBridgeError as e:
 			print(e)
 
@@ -69,17 +98,41 @@ class cource_following_learning_node:
 		resp.success = True
 		return resp
 
+	def model_save(self,data):
+		rospy.wait_for_service('/model_save')
+		service = rospy.ServiceProxy('/model_save', Trigger)
+        	self.dl.save(self.save_path)
+	
+	def callback_save(self, data):
+		if data.data == 1:
+			self.dl.save()
+		else:
+			pass
+
 	def loop(self):
+		
 		if self.cv_image.size != 640 * 480 * 3:
 			return
-		
+		if self.cv_left_image.size != 640 * 480 * 3:
+			return
+		if self.cv_right_image.size != 640 * 480 * 3:
+			return
+	
 		img = resize(self.cv_image, (48, 64), mode='constant')
 		r, g, b = cv2.split(img)
 		imgobj = np.asanyarray([r,g,b])
 
+		img_left = resize(self.cv_left_image, (48, 64), mode='constant')
+		r, g, b = cv2.split(img_left)
+		imgobj_left = np.asanyarray([r,g,b])
+		
+		img_right = resize(self.cv_right_image, (48, 64), mode='constant')
+		r, g, b = cv2.split(img_right)
+		imgobj_right = np.asanyarray([r,g,b])
+
 		ros_time = str(rospy.Time.now())
 
-		self.dl.load()
+		self.episode += 1
 
 		if self.joy_linear > 0.0:
 			self.learning= True
@@ -90,8 +143,13 @@ class cource_following_learning_node:
 			target_action = self.joy_angular
 			action, loss = self.dl.act_and_trains(imgobj, target_action)
 			angle_error = abs(action - target_action)
+
+			if abs(target_action) < 0.1:
+				action_left,  loss_left  = self.dl.act_and_trains(imgobj_left, target_action - 0.2)
+				action_right, loss_right = self.dl.act_and_trains(imgobj_right, target_action + 0.2)
+
 			print(" episode: " + str(self.episode) + ", loss: " + str(loss) + ", angle_error: " + str(angle_error))
-			self.episode += 1
+			
 			line = [str(self.episode), "training", str(loss), str(angle_error)]
 			with open(self.path + self.start_time + '/' + 'reward.csv', 'a') as f:
 				writer = csv.writer(f, lineterminator='\n')
@@ -103,7 +161,7 @@ class cource_following_learning_node:
 		else:
 			if self.switch_mode:
 				target_action = self.dl.act(imgobj)
-				print("TEST MODE: " + " angular:" + str(target_action))
+				print("TEST MODE: " +" episode: " + str(self.episode) + " angular:" + str(target_action))
 				angle_error = abs(self.action - target_action)
 				line = [str(self.episode), "test", "0", str(angle_error)]
 				with open(self.path + self.start_time + '/' + 'reward.csv', 'a') as f:
@@ -112,13 +170,18 @@ class cource_following_learning_node:
 				self.vel.linear.x = 0.2
 				self.vel.angular.z = target_action
 				self.nav_pub.publish(self.vel)
+			"""
 			else:
 				self.vel.linear.x = 0.2
 				self.vel.angular.z = self.action
 				self.nav_pub.publish(self.vel)
-
+			"""	
 		temp = copy.deepcopy(img)
 		cv2.imshow("Resized Image", temp)
+		temp = copy.deepcopy(img_left)
+		cv2.imshow("Resized Left Image", temp)
+		temp = copy.deepcopy(img_right)
+		cv2.imshow("Resized Right Image", temp)
 		cv2.waitKey(1)
 
 if __name__ == '__main__':

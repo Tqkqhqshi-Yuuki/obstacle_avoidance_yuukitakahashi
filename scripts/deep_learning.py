@@ -96,12 +96,12 @@ class deep_learning:
 	def result(self):
 			accuracy = self.accuracy
 			return accuracy
+			
+	def save(self, save_path):
+		chainer.serializers.save_npz(save_path, self.net)
 
-	def save(self):
-		chainer.serializers.save_npz('/home/rdclab/learning_ws/src/obstacle_avoidance/net_models/cnn_test.net', self.net)
-
-	def load(self):
-		chainer.serializers.load_npz('/home/rdclab/learning_ws/src/obstacle_avoidance/net_models/proposed_old_10000step.net', self.net)
+	def load(self, path):
+		chainer.serializers.load_npz(path, self.net)
 
 if __name__ == '__main__':
         dl = deep_learning()
